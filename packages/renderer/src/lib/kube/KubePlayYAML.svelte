@@ -12,6 +12,9 @@ import type { OpenDialogOptions } from '@podman-desktop/api';
 import { Button, ErrorMessage, Input } from '@podman-desktop/ui-svelte';
 import Fa from 'svelte-fa';
 
+import { handleNavigation } from '/@/navigation';
+import { NavigationPage } from '/@api/navigation-page';
+
 import { providerInfos } from '../../stores/providers';
 import MonacoEditor from '../editor/MonacoEditor.svelte';
 import NoContainerEngineEmptyScreen from '../image/NoContainerEngineEmptyScreen.svelte';
@@ -155,8 +158,11 @@ onDestroy(() => {
   }
 });
 
-function goBackToHistory(): void {
-  window.history.go(-1);
+function goBackToPodsPage(): void {
+  // redirect to the pods page
+  handleNavigation({
+    page: NavigationPage.PODS,
+  });
 }
 </script>
 
@@ -190,6 +196,8 @@ function goBackToHistory(): void {
           hidden={providerConnections.length === 0}
           class:border-2={defaultContextName}
           class="rounded-md p-5 cursor-pointer bg-[var(--pd-content-card-inset-bg)]"
+          aria-label="Podman Container Engine Runtime"
+          aria-pressed={userChoice === 'podman' ? 'true' : 'false'}
           class:border-[var(--pd-content-card-border-selected)]={userChoice === 'podman'}
           class:border-[var(--pd-content-card-border)]={userChoice !== 'podman'}
           on:click={() => {
@@ -233,6 +241,8 @@ function goBackToHistory(): void {
         <button
           hidden={!defaultContextName}
           class="border-2 rounded-md p-5 cursor-pointer bg-[var(--pd-content-card-inset-bg)]"
+          aria-label="Kubernetes Cluster Runtime"
+          aria-pressed={userChoice === 'kubernetes' ? 'true' : 'false'}
           class:border-[var(--pd-content-card-border-selected)]={userChoice === 'kubernetes'}
           class:border-[var(--pd-content-card-border)]={userChoice !== 'kubernetes'}
           on:click={() => {
@@ -264,6 +274,7 @@ function goBackToHistory(): void {
               <Input
                 disabled={userChoice === 'podman'}
                 bind:value={defaultContextName}
+                aria-label="Default Kubernetes Context"
                 name="defaultContextName"
                 id="defaultContextName"
                 readonly
@@ -282,6 +293,7 @@ function goBackToHistory(): void {
               <select
                 disabled={userChoice === 'podman'}
                 class="w-full p-2 outline-none text-sm bg-[var(--pd-select-bg)] rounded-sm text-[var(--pd-content-card-text)]"
+                aria-label="Kubernetes Namespace"
                 name="namespaceChoice"
                 bind:value={currentNamespace}>
                 {#each allNamespaces.items as namespace}
@@ -339,7 +351,7 @@ function goBackToHistory(): void {
       {/if}
 
       {#if runFinished}
-        <Button on:click={() => goBackToHistory()} class="w-full">Done</Button>
+        <Button on:click={() => goBackToPodsPage()} class="w-full">Done</Button>
       {/if}
     </div>
   </EngineFormPage>

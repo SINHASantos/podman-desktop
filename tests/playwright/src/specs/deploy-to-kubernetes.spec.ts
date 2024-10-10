@@ -30,25 +30,28 @@ import {
 import { waitForPodmanMachineStartup } from '../utility/wait';
 
 const CLUSTER_NAME: string = 'kind-cluster';
-const CLUSTER_CREATION_TIMEOUT: number = 200000;
+const CLUSTER_CREATION_TIMEOUT: number = 300_000;
 const KIND_CONTAINER_NAME: string = `${CLUSTER_NAME}-control-plane`;
 const KUBERNETES_CONTEXT: string = `kind-${CLUSTER_NAME}`;
 const IMAGE_TO_PULL: string = 'ghcr.io/linuxcontainers/alpine';
 const IMAGE_TAG: string = 'latest';
-const CONTAINER_NAME: string = 'alphine-container';
+const CONTAINER_NAME: string = 'alpine-container';
 const NAMESPACE: string = 'default';
 const DEPLOYED_POD_NAME: string = `${CONTAINER_NAME} ${KIND_CONTAINER_NAME} ${NAMESPACE}`;
 const CONTAINER_START_PARAMS: ContainerInteractiveParams = { attachTerminal: false };
 
 const skipKindInstallation = process.env.SKIP_KIND_INSTALL ? process.env.SKIP_KIND_INSTALL : false;
 
-test.beforeAll(async ({ runner, welcomePage, page }) => {
+test.beforeAll(async ({ runner, welcomePage, page, navigationBar }) => {
   test.setTimeout(250000);
   runner.setVideoAndTraceName('deploy-to-k8s-e2e');
 
   await welcomePage.handleWelcomePage(true);
   await waitForPodmanMachineStartup(page);
   if (!skipKindInstallation) {
+    const settingsBar = await navigationBar.openSettings();
+    await settingsBar.cliToolsTab.click();
+
     await ensureKindCliInstalled(page);
   }
   await createKindCluster(page, CLUSTER_NAME, true, CLUSTER_CREATION_TIMEOUT);
@@ -59,17 +62,18 @@ test.afterAll(async ({ runner, page }) => {
   try {
     await deleteContainer(page, CONTAINER_NAME);
     await deleteImage(page, IMAGE_TO_PULL);
-    await deleteKindCluster(page, KIND_CONTAINER_NAME);
+    await deleteKindCluster(page, KIND_CONTAINER_NAME, CLUSTER_NAME);
   } finally {
     await runner.close();
   }
 });
 
-test.describe('Deploy a container to the Kind cluster', () => {
-  test.skip(
-    !!process.env.GITHUB_ACTIONS && process.env.RUNNER_OS === 'Linux',
-    'Tests suite should not run on Linux platform',
-  );
+test.skip(
+  !!process.env.GITHUB_ACTIONS && process.env.RUNNER_OS === 'Linux',
+  'Tests suite should not run on Linux platform',
+);
+
+test.describe.serial('Deploy a container to the Kind cluster', () => {
   test('Pull an image and start a container', async ({ navigationBar }) => {
     const imagesPage = await navigationBar.openImages();
     const pullImagePage = await imagesPage.openPullImage();

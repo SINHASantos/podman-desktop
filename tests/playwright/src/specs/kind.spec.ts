@@ -34,9 +34,9 @@ const RESOURCE_NAME: string = 'kind';
 const EXTENSION_LABEL: string = 'podman-desktop.kind';
 const CLUSTER_NAME: string = 'kind-cluster';
 const KIND_CONTAINER_NAME: string = `${CLUSTER_NAME}-control-plane`;
-const CLUSTER_CREATION_TIMEOUT: number = 200000;
-
+const CLUSTER_CREATION_TIMEOUT: number = 300_000;
 let resourcesPage: ResourcesPage;
+
 let kindResourceCard: ResourceConnectionCardPage;
 
 const skipKindInstallation = process.env.SKIP_KIND_INSTALL ? process.env.SKIP_KIND_INSTALL : false;
@@ -49,14 +49,21 @@ test.beforeAll(async ({ runner, page, welcomePage }) => {
   kindResourceCard = new ResourceConnectionCardPage(page, RESOURCE_NAME);
 });
 
-test.afterAll(async ({ runner }) => {
-  await runner.close();
+test.afterAll(async ({ runner, page }) => {
+  try {
+    await deleteKindCluster(page, KIND_CONTAINER_NAME, CLUSTER_NAME);
+  } finally {
+    await runner.close();
+  }
 });
 
 test.describe.serial('Kind End-to-End Tests', () => {
   test.describe.serial('Kind installation', () => {
-    test('Install Kind CLI', async ({ page }) => {
+    test('Install Kind CLI', async ({ page, navigationBar }) => {
       test.skip(!!skipKindInstallation, 'Skipping Kind installation');
+      const settingsBar = await navigationBar.openSettings();
+      await settingsBar.cliToolsTab.click();
+
       await ensureKindCliInstalled(page);
     });
 
@@ -125,7 +132,7 @@ test.describe.serial('Kind End-to-End Tests', () => {
     });
 
     test('Kind cluster operations - DELETE', async ({ page }) => {
-      await deleteKindCluster(page, KIND_CONTAINER_NAME);
+      await deleteKindCluster(page, KIND_CONTAINER_NAME, CLUSTER_NAME);
     });
   });
 });

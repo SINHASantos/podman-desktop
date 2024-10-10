@@ -15,8 +15,9 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  ***********************************************************************/
-/* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable @typescript-eslint/no-explicit-any,@typescript-eslint/explicit-function-return-type */
 
+import type * as proc from 'node:child_process';
 import * as fs from 'node:fs';
 import { arch } from 'node:os';
 
@@ -37,8 +38,10 @@ import * as extension from './extension';
 import type { InstalledPodman } from './podman-cli';
 import * as podmanCli from './podman-cli';
 import { PodmanConfiguration } from './podman-configuration';
+import type { UpdateCheck } from './podman-install';
 import { PodmanInstall } from './podman-install';
 import { getAssetsFolder, isLinux, isMac, isWindows, LIBKRUN_LABEL, LoggerDelegator, VMTYPE } from './util';
+import * as util from './util';
 
 const config: Configuration = {
   get: () => {
@@ -88,6 +91,9 @@ const machineInfo: extension.MachineInfo = {
   diskUsage: 0,
   memoryUsage: 0,
   vmType: VMTYPE.LIBKRUN,
+  port: 1234,
+  remoteUsername: 'user',
+  identityPath: '/path/to/key',
 };
 
 const podmanConfiguration = {} as unknown as PodmanConfiguration;
@@ -107,6 +113,7 @@ const telemetryLogger: extensionApi.TelemetryLogger = {
 const mocks = vi.hoisted(() => ({
   getPodmanLocationMacMock: vi.fn(),
   getKrunkitVersionMock: vi.fn(),
+  getQemuVersionMock: vi.fn(),
 }));
 
 // mock ps-list
@@ -127,6 +134,9 @@ beforeEach(() => {
       Starting: false,
       Default: false,
       VMType: VMTYPE.LIBKRUN,
+      Port: 123,
+      RemoteUsername: 'user',
+      IdentityPath: '/path/to/key',
     },
     {
       Name: machine1Name,
@@ -137,6 +147,9 @@ beforeEach(() => {
       Starting: false,
       Default: true,
       VMType: VMTYPE.LIBKRUN,
+      Port: 456,
+      RemoteUsername: 'admin',
+      IdentityPath: '/path/to/key1',
     },
   ];
 
@@ -180,15 +193,29 @@ vi.mock('@podman-desktop/api', async () => {
     provider: {
       onDidRegisterContainerConnection: vi.fn(),
       onDidUnregisterContainerConnection: vi.fn(),
+      createProvider: (): extensionApi.Provider => provider,
+    },
+    registry: {
+      registerRegistryProvider: vi.fn(),
+      onDidRegisterRegistry: vi.fn(),
+      onDidUnregisterRegistry: vi.fn(),
+      onDidUpdateRegistry: vi.fn(),
     },
     proxy: {
       isEnabled: (): boolean => false,
+      onDidUpdateProxy: vi.fn(),
+      onDidStateChange: vi.fn(),
+      getProxySettings: vi.fn(),
     },
     window: {
       showErrorMessage: vi.fn(),
       showInformationMessage: vi.fn(),
       showWarningMessage: vi.fn(),
       showNotification: vi.fn(),
+      createStatusBarItem: () => ({
+        show: vi.fn(),
+        dispose: vi.fn(),
+      }),
     },
     context: {
       setValue: vi.fn(),
@@ -207,6 +234,24 @@ vi.mock('@podman-desktop/api', async () => {
     },
     Disposable: {
       from: vi.fn(),
+      create: vi.fn(),
+    },
+    fs: {
+      createFileSystemWatcher: vi.fn(),
+    },
+  };
+});
+
+vi.mock('node:child_process', async () => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+  const childProcessActual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+  return {
+    ...childProcessActual,
+    env: vi.fn(),
+    spawn: () => {
+      return {
+        on: vi.fn(),
+      } as unknown as proc.ChildProcess;
     },
   };
 });
@@ -222,6 +267,12 @@ vi.mock('node:os', async () => {
     arch: vi.fn(),
   };
 });
+
+vi.mock('./qemu-helper', () => ({
+  QemuHelper: vi.fn().mockReturnValue({
+    getQemuVersion: mocks.getQemuVersionMock,
+  }),
+}));
 
 vi.mock('./krunkit-helper', async () => {
   return {
@@ -252,21 +303,6 @@ vi.mock('./podman-info-helper', async () => {
     }),
   };
 });
-vi.mock('./wsl-helper', async () => {
-  return {
-    WslHelper: vi.fn().mockImplementation(() => {
-      return {
-        getWSLVersionData: vi.fn().mockImplementation(() => {
-          return Promise.resolve({
-            wslVersion: '1.2.3',
-            kernelVersion: '1.2.3',
-            windowsVersion: '1.2.3',
-          });
-        }),
-      };
-    }),
-  };
-});
 
 vi.mock('./util', async () => {
   // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -283,6 +319,10 @@ vi.mock('./util', async () => {
 beforeEach(() => {
   vi.resetAllMocks();
   console.error = consoleErrorMock;
+
+  (extensionApi.env.isMac as boolean) = true;
+  (extensionApi.env.isLinux as boolean) = false;
+  (extensionApi.env.isWindows as boolean) = false;
 });
 
 afterEach(() => {
@@ -307,7 +347,7 @@ test('verify create command called with correct values', async () => {
   });
   expect(spyExecPromise).toBeCalledWith(
     podmanCli.getPodmanCli(),
-    ['machine', 'init', '--cpus', '2', '--memory', '999', '--disk-size', '232', '--image-path', 'path', '--rootful'],
+    ['machine', 'init', '--cpus', '2', '--memory', '1000', '--disk-size', '232', '--image-path', 'path', '--rootful'],
     {
       logger: undefined,
       token: undefined,
@@ -325,6 +365,108 @@ test('verify create command called with correct values', async () => {
   expect(telemetryLogger.logUsage).toBeCalledWith(
     'podman.machine.init',
     expect.objectContaining({ cpus: '2', defaultName: true, diskSize: '250000000000', imagePath: 'custom' }),
+  );
+});
+
+test('verify create command called with correct image-path values with image URL', async () => {
+  const spyExecPromise = vi.spyOn(extensionApi.process, 'exec');
+  spyExecPromise.mockImplementationOnce(() => {
+    return Promise.resolve({} as extensionApi.RunResult);
+  });
+  vi.spyOn(extensionApi.process, 'exec').mockResolvedValueOnce({
+    stdout: 'podman version 5.0.0',
+  } as extensionApi.RunResult);
+
+  await extension.createMachine({
+    'podman.factory.machine.cpus': '2',
+    'podman.factory.machine.image-uri': 'https://host/file',
+    'podman.factory.machine.memory': '1048000000', // 1048MB = 999.45MiB
+    'podman.factory.machine.diskSize': '250000000000', // 250GB = 232.83GiB
+    'podman.factory.machine.provider': LIBKRUN_LABEL,
+  });
+  expect(spyExecPromise).toBeCalledWith(
+    podmanCli.getPodmanCli(),
+    [
+      'machine',
+      'init',
+      '--cpus',
+      '2',
+      '--memory',
+      '1000',
+      '--disk-size',
+      '232',
+      '--image-path',
+      'https://host/file',
+      '--rootful',
+    ],
+    {
+      logger: undefined,
+      token: undefined,
+      env: {
+        CONTAINERS_MACHINE_PROVIDER: VMTYPE.LIBKRUN,
+      },
+    },
+  );
+
+  // wait a call on telemetryLogger.logUsage
+  while ((telemetryLogger.logUsage as Mock).mock.calls.length === 0) {
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  expect(telemetryLogger.logUsage).toBeCalledWith(
+    'podman.machine.init',
+    expect.objectContaining({ cpus: '2', defaultName: true, diskSize: '250000000000', imagePath: 'custom-url' }),
+  );
+});
+
+test('verify create command called with correct image-path values with registry', async () => {
+  const spyExecPromise = vi.spyOn(extensionApi.process, 'exec');
+  spyExecPromise.mockImplementationOnce(() => {
+    return Promise.resolve({} as extensionApi.RunResult);
+  });
+  vi.spyOn(extensionApi.process, 'exec').mockResolvedValueOnce({
+    stdout: 'podman version 5.0.0',
+  } as extensionApi.RunResult);
+
+  await extension.createMachine({
+    'podman.factory.machine.cpus': '2',
+    'podman.factory.machine.image-uri': 'registry/repo/image:version',
+    'podman.factory.machine.memory': '1048000000', // 1048MB = 999.45MiB
+    'podman.factory.machine.diskSize': '250000000000', // 250GB = 232.83GiB
+    'podman.factory.machine.provider': LIBKRUN_LABEL,
+  });
+  expect(spyExecPromise).toBeCalledWith(
+    podmanCli.getPodmanCli(),
+    [
+      'machine',
+      'init',
+      '--cpus',
+      '2',
+      '--memory',
+      '1000',
+      '--disk-size',
+      '232',
+      '--image-path',
+      'docker://registry/repo/image:version',
+      '--rootful',
+    ],
+    {
+      logger: undefined,
+      token: undefined,
+      env: {
+        CONTAINERS_MACHINE_PROVIDER: VMTYPE.LIBKRUN,
+      },
+    },
+  );
+
+  // wait a call on telemetryLogger.logUsage
+  while ((telemetryLogger.logUsage as Mock).mock.calls.length === 0) {
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  expect(telemetryLogger.logUsage).toBeCalledWith(
+    'podman.machine.init',
+    expect.objectContaining({ cpus: '2', defaultName: true, diskSize: '250000000000', imagePath: 'custom-registry' }),
   );
 });
 
@@ -350,7 +492,7 @@ test('verify create command called with correct values with user mode networking
     '--cpus',
     '2',
     '--memory',
-    '999',
+    '1000',
     '--disk-size',
     '232',
     '--image-path',
@@ -396,7 +538,7 @@ test('verify create command called with now flag if start machine after creation
     '--cpus',
     '2',
     '--memory',
-    '999',
+    '1000',
     '--disk-size',
     '232',
     '--image-path',
@@ -487,6 +629,9 @@ test('checkDefaultMachine: do not prompt if the running machine is already the d
       Starting: false,
       Default: true,
       VMType: VMTYPE.LIBKRUN,
+      Port: 123,
+      RemoteUsername: 'user',
+      IdentityPath: '/path/to/key',
     },
     {
       Name: 'podman-machine-1',
@@ -497,6 +642,9 @@ test('checkDefaultMachine: do not prompt if the running machine is already the d
       Starting: false,
       Default: false,
       VMType: VMTYPE.LIBKRUN,
+      Port: 456,
+      RemoteUsername: 'admin',
+      IdentityPath: '/path/to/key`',
     },
   ];
 
@@ -902,6 +1050,9 @@ test('test checkDefaultMachine, if the default connection is not in sync with th
       Starting: false,
       Default: true,
       VMType: VMTYPE.LIBKRUN,
+      Port: 123,
+      RemoteUsername: 'user',
+      IdentityPath: '/path/to/key',
     },
   ];
 
@@ -1081,6 +1232,69 @@ test('ensure stopped machine reports stopped provider', async () => {
   await extension.updateMachines(provider, podmanConfiguration);
 
   expect(provider.updateStatus).toBeCalledWith('configured');
+  expect(extension.podmanMachinesStatuses.get('podman-machine-default')).toBe('stopped');
+});
+
+test('ensure running and starting machine reports starting provider', async () => {
+  extension.initExtensionContext({ subscriptions: [] } as unknown as extensionApi.ExtensionContext);
+  vi.mocked(isLinux).mockReturnValue(false);
+  vi.mocked(isMac).mockReturnValue(true);
+  vi.spyOn(extensionApi.process, 'exec').mockImplementation(
+    (_command, args) =>
+      new Promise<extensionApi.RunResult>(resolve => {
+        if (args?.[0] === 'machine' && args?.[1] === 'list') {
+          const fakeStoppedMachine = JSON.parse(JSON.stringify(fakeMachineJSON[0]));
+          fakeStoppedMachine.Running = true;
+          fakeStoppedMachine.Starting = true;
+
+          resolve({ stdout: JSON.stringify([fakeStoppedMachine]) } as extensionApi.RunResult);
+        } else if (args?.[0] === 'machine' && args?.[1] === 'inspect') {
+          resolve({} as extensionApi.RunResult);
+        } else if (args?.[0] === 'system' && args?.[1] === 'connection' && args?.[2] === 'list') {
+          resolve({
+            stdout: JSON.stringify([{ Name: fakeMachineJSON[0].Name, Default: true }]),
+          } as extensionApi.RunResult);
+        } else if (args?.[0] === '--version') {
+          resolve({ stdout: 'podman version 4.9.0' } as extensionApi.RunResult);
+        }
+      }),
+  );
+
+  await extension.updateMachines(provider, podmanConfiguration);
+
+  expect(provider.updateStatus).toBeCalledWith('starting');
+  expect(extension.podmanMachinesStatuses.get('podman-machine-default')).toBe('starting');
+});
+
+test('ensure running and not starting machine reports ready provider', async () => {
+  extension.initExtensionContext({ subscriptions: [] } as unknown as extensionApi.ExtensionContext);
+  vi.mocked(isLinux).mockReturnValue(false);
+  vi.mocked(isMac).mockReturnValue(true);
+  vi.spyOn(extensionApi.process, 'exec').mockImplementation(
+    (_command, args) =>
+      new Promise<extensionApi.RunResult>(resolve => {
+        if (args?.[0] === 'machine' && args?.[1] === 'list') {
+          const fakeStoppedMachine = JSON.parse(JSON.stringify(fakeMachineJSON[0]));
+          fakeStoppedMachine.Running = true;
+          fakeStoppedMachine.Starting = false;
+
+          resolve({ stdout: JSON.stringify([fakeStoppedMachine]) } as extensionApi.RunResult);
+        } else if (args?.[0] === 'machine' && args?.[1] === 'inspect') {
+          resolve({} as extensionApi.RunResult);
+        } else if (args?.[0] === 'system' && args?.[1] === 'connection' && args?.[2] === 'list') {
+          resolve({
+            stdout: JSON.stringify([{ Name: fakeMachineJSON[0].Name, Default: true }]),
+          } as extensionApi.RunResult);
+        } else if (args?.[0] === '--version') {
+          resolve({ stdout: 'podman version 4.9.0' } as extensionApi.RunResult);
+        }
+      }),
+  );
+
+  await extension.updateMachines(provider, podmanConfiguration);
+
+  expect(provider.updateStatus).toBeCalledWith('ready');
+  expect(extension.podmanMachinesStatuses.get('podman-machine-default')).toBe('started');
 });
 
 test('ensure started machine reports configuration', async () => {
@@ -1902,6 +2116,40 @@ describe('registerOnboardingRemoveUnsupportedMachinesCommand', () => {
       stdout: 'podman version 5.0.0',
     } as unknown as extensionApi.RunResult);
 
+    vi.mocked(extensionApi.process.exec).mockResolvedValueOnce({
+      stdout: 'unknown message: 1.2.5.0',
+      stderr: '',
+      command: 'command',
+    });
+
+    vi.mocked(extensionApi.process.exec).mockResolvedValueOnce({
+      stdout: 'podman version 5.2.0',
+    } as unknown as extensionApi.RunResult);
+
+    vi.mocked(extensionApi.process.exec).mockResolvedValueOnce({
+      stdout: 'True',
+      stderr: '',
+      command: 'command',
+    });
+
+    vi.mocked(extensionApi.process.exec).mockResolvedValueOnce({
+      stdout: 'True',
+      stderr: '',
+      command: 'command',
+    });
+
+    vi.mocked(extensionApi.process.exec).mockResolvedValueOnce({
+      stdout: 'True',
+      stderr: '',
+      command: 'command',
+    });
+
+    vi.mocked(extensionApi.process.exec).mockResolvedValueOnce({
+      stdout: 'Running',
+      stderr: '',
+      command: 'command',
+    });
+
     // two times false (no qemu folders)
     vi.mocked(fs.existsSync).mockReturnValueOnce(false);
     vi.mocked(fs.existsSync).mockReturnValueOnce(false);
@@ -1966,24 +2214,28 @@ describe('calcPodmanMachineSetting', () => {
 
   test('setValue to true if OS is MacOS', async () => {
     vi.mocked(isWindows).mockReturnValue(false);
-    await extension.calcPodmanMachineSetting(podmanConfiguration);
+    await extension.calcPodmanMachineSetting();
     expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_CPU_SUPPORTED_KEY, true);
     expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_MEMORY_SUPPORTED_KEY, true);
     expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_DISK_SUPPORTED_KEY, true);
   });
-  test('setValue to true if OS is Windows and uses HyperV - set env variable', async () => {
+  test('setValue to true if OS is Windows and uses HyperV', async () => {
     vi.mocked(isWindows).mockReturnValue(true);
-    process.env.CONTAINERS_MACHINE_PROVIDER = 'hyperv';
-    vi.spyOn(podmanConfiguration, 'matchRegexpInContainersConfig').mockResolvedValue(false);
-    await extension.calcPodmanMachineSetting(podmanConfiguration);
-    expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_CPU_SUPPORTED_KEY, true);
-    expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_MEMORY_SUPPORTED_KEY, true);
-    expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_DISK_SUPPORTED_KEY, true);
-  });
-  test('setValue to true if OS is Windows and uses HyperV - set by config file', async () => {
-    vi.mocked(isWindows).mockReturnValue(true);
-    vi.spyOn(podmanConfiguration, 'matchRegexpInContainersConfig').mockResolvedValue(true);
-    await extension.calcPodmanMachineSetting(podmanConfiguration);
+    vi.spyOn(podmanCli, 'getPodmanInstallation').mockResolvedValue({
+      version: '5.2.1',
+    });
+    vi.spyOn(extensionApi.process, 'exec').mockImplementation((command, args) => {
+      return new Promise<extensionApi.RunResult>(resolve => {
+        if (command === 'powershell.exe') {
+          resolve({
+            stdout: args?.[0] === '@(Get-Service vmms).Status' ? 'Running' : 'True',
+            stderr: '',
+            command: 'command',
+          });
+        }
+      });
+    });
+    await extension.calcPodmanMachineSetting();
     expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_CPU_SUPPORTED_KEY, true);
     expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_MEMORY_SUPPORTED_KEY, true);
     expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_DISK_SUPPORTED_KEY, true);
@@ -1992,7 +2244,7 @@ describe('calcPodmanMachineSetting', () => {
     vi.mocked(isWindows).mockReturnValue(true);
     process.env.CONTAINERS_MACHINE_PROVIDER = 'wsl';
     vi.spyOn(podmanConfiguration, 'matchRegexpInContainersConfig').mockResolvedValue(false);
-    await extension.calcPodmanMachineSetting(podmanConfiguration);
+    await extension.calcPodmanMachineSetting();
     expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_CPU_SUPPORTED_KEY, false);
     expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_MEMORY_SUPPORTED_KEY, false);
     expect(extensionApi.context.setValue).toBeCalledWith(extension.PODMAN_MACHINE_DISK_SUPPORTED_KEY, false);
@@ -2098,59 +2350,117 @@ test('isLibkrunSupported should return false with previous 5.1.2 version', async
   expect(enabled).toBeFalsy();
 });
 
-test('sendTelemetryRecords with krunkit found', async () => {
-  vi.spyOn(podmanCli, 'getPodmanInstallation').mockResolvedValue({
-    version: '5.1.2',
+describe('sendTelemetryRecords', () => {
+  test('krunkit found', async () => {
+    vi.spyOn(podmanCli, 'getPodmanInstallation').mockResolvedValue({
+      version: '5.1.2',
+    });
+    mocks.getPodmanLocationMacMock.mockResolvedValue({ foundPath: '/opt/podman/bin/podman', source: 'installer' });
+    mocks.getKrunkitVersionMock.mockResolvedValue('1.2.3');
+
+    extension.sendTelemetryRecords(
+      'evt',
+      {
+        provider: 'libkrun',
+      } as Record<string, unknown>,
+      false,
+    );
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(telemetryLogger.logUsage).toHaveBeenCalledWith(
+      'evt',
+      expect.objectContaining({
+        krunkitPath: '/opt/podman/bin',
+        krunkitVersion: '1.2.3',
+        podmanCliFoundPath: '/opt/podman/bin/podman',
+        podmanCliSource: 'installer',
+        podmanCliVersion: '5.1.2',
+        provider: 'libkrun',
+      }),
+    );
   });
-  mocks.getPodmanLocationMacMock.mockResolvedValue({ foundPath: '/opt/podman/bin/podman', source: 'installer' });
-  mocks.getKrunkitVersionMock.mockResolvedValue('1.2.3');
 
-  extension.sendTelemetryRecords(
-    'evt',
-    {
-      provider: 'libkrun',
-    } as Record<string, unknown>,
-    false,
-  );
-  await new Promise(resolve => setTimeout(resolve, 100));
-  expect(telemetryLogger.logUsage).toHaveBeenCalledWith(
-    'evt',
-    expect.objectContaining({
-      krunkitPath: '/opt/podman/bin',
-      krunkitVersion: '1.2.3',
-      podmanCliFoundPath: '/opt/podman/bin/podman',
-      podmanCliSource: 'installer',
-      podmanCliVersion: '5.1.2',
-      provider: 'libkrun',
-    }),
-  );
-});
+  test('krunkit not found', async () => {
+    vi.spyOn(podmanCli, 'getPodmanInstallation').mockResolvedValue({
+      version: '5.1.2',
+    });
+    mocks.getPodmanLocationMacMock.mockResolvedValue({ foundPath: '/opt/podman/bin/podman', source: 'installer' });
+    mocks.getKrunkitVersionMock.mockRejectedValue('command not found');
 
-test('sendTelemetryRecords with krunkit not found', async () => {
-  vi.spyOn(podmanCli, 'getPodmanInstallation').mockResolvedValue({
-    version: '5.1.2',
+    extension.sendTelemetryRecords(
+      'evt',
+      {
+        provider: 'libkrun',
+      } as Record<string, unknown>,
+      false,
+    );
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(telemetryLogger.logUsage).toHaveBeenCalledWith(
+      'evt',
+      expect.objectContaining({
+        errorKrunkitVersion: 'command not found',
+        podmanCliFoundPath: '/opt/podman/bin/podman',
+        podmanCliSource: 'installer',
+        podmanCliVersion: '5.1.2',
+        provider: 'libkrun',
+      }),
+    );
   });
-  mocks.getPodmanLocationMacMock.mockResolvedValue({ foundPath: '/opt/podman/bin/podman', source: 'installer' });
-  mocks.getKrunkitVersionMock.mockRejectedValue('command not found');
 
-  extension.sendTelemetryRecords(
-    'evt',
-    {
-      provider: 'libkrun',
-    } as Record<string, unknown>,
-    false,
-  );
-  await new Promise(resolve => setTimeout(resolve, 100));
-  expect(telemetryLogger.logUsage).toHaveBeenCalledWith(
-    'evt',
-    expect.objectContaining({
-      errorKrunkitVersion: 'command not found',
-      podmanCliFoundPath: '/opt/podman/bin/podman',
-      podmanCliSource: 'installer',
-      podmanCliVersion: '5.1.2',
-      provider: 'libkrun',
-    }),
-  );
+  test('qemu found', async () => {
+    vi.spyOn(podmanCli, 'getPodmanInstallation').mockResolvedValue({
+      version: '5.1.2',
+    });
+    extension.sendTelemetryRecords(
+      'evt',
+      {
+        provider: 'qemu',
+      } as Record<string, unknown>,
+      false,
+    );
+    (extensionApi.env.isLinux as boolean) = true;
+    (extensionApi.env.isMac as boolean) = false;
+    (extensionApi.env.isWindows as boolean) = false;
+
+    mocks.getQemuVersionMock.mockResolvedValue('5.5.5');
+
+    await vi.waitFor(() => {
+      expect(telemetryLogger.logUsage).toHaveBeenCalledWith(
+        'evt',
+        expect.objectContaining({
+          provider: 'qemu',
+          qemuVersion: '5.5.5',
+        }),
+      );
+    });
+  });
+
+  test('qemu not found', async () => {
+    vi.spyOn(podmanCli, 'getPodmanInstallation').mockResolvedValue({
+      version: '5.1.2',
+    });
+    extension.sendTelemetryRecords(
+      'evt',
+      {
+        provider: 'qemu',
+      } as Record<string, unknown>,
+      false,
+    );
+    (extensionApi.env.isLinux as boolean) = true;
+    (extensionApi.env.isMac as boolean) = false;
+    (extensionApi.env.isWindows as boolean) = false;
+
+    mocks.getQemuVersionMock.mockRejectedValue('command not found');
+
+    await vi.waitFor(() => {
+      expect(telemetryLogger.logUsage).toHaveBeenCalledWith(
+        'evt',
+        expect.objectContaining({
+          provider: 'qemu',
+          errorQemuVersion: 'command not found',
+        }),
+      );
+    });
+  });
 });
 
 test('if a machine stopped is successfully reporting telemetry', async () => {
@@ -2215,4 +2525,450 @@ test('if a machine stopped is successfully reporting an error in telemetry', asy
   );
 
   expect(spyExecPromise).toBeCalledWith(podmanCli.getPodmanCli(), ['machine', 'stop', 'name'], expect.anything());
+});
+
+test('activate function returns an api implementation', async () => {
+  vi.spyOn(PodmanInstall.prototype, 'checkForUpdate').mockResolvedValue({
+    hasUpdate: false,
+  } as unknown as UpdateCheck);
+  const contextMock = {
+    subscriptions: [],
+    secrets: {
+      delete: vi.fn(),
+      get: vi.fn(),
+      onDidChange: vi.fn(),
+      store: vi.fn(),
+    },
+  } as unknown as extensionApi.ExtensionContext;
+  const api = await extension.activate(contextMock);
+  expect(api).toBeDefined();
+  expect(typeof api.exec).toBe('function');
+});
+
+function mockExtensionForAuditTests() {
+  vi.spyOn(PodmanInstall.prototype, 'checkForUpdate').mockResolvedValue({
+    hasUpdate: false,
+  } as unknown as UpdateCheck);
+  const contextMock = {
+    subscriptions: [],
+    secrets: {
+      delete: vi.fn(),
+      get: vi.fn(),
+      onDidChange: vi.fn(),
+      store: vi.fn(),
+    },
+  } as unknown as extensionApi.ExtensionContext;
+  vi.spyOn(provider, 'setContainerProviderConnectionFactory');
+  return contextMock;
+}
+
+async function testAudit(path: string, uri: string, condition: typeof expect | typeof expect.not): Promise<void> {
+  const contextMock = mockExtensionForAuditTests();
+  let auditorInstance: extensionApi.Auditor | undefined;
+  vi.mocked(provider.setContainerProviderConnectionFactory).mockImplementation(
+    (options: extensionApi.ContainerProviderConnectionFactory, auditor: extensionApi.Auditor | undefined) => {
+      auditorInstance = auditor;
+      return {
+        dispose: () => {},
+      };
+    },
+  );
+  await extension.activate(contextMock);
+  expect(vi.mocked(provider.setContainerProviderConnectionFactory)).toBeCalled();
+  expect(auditorInstance).toBeDefined();
+  const auditRecords: extensionApi.AuditResult = await auditorInstance!.auditItems({
+    'podman.factory.machine.cpus': '2',
+    'podman.factory.machine.image-path': path,
+    'podman.factory.machine.image-uri': uri,
+    'podman.factory.machine.memory': '1048000000', // 1048MB = 999.45MiB
+    'podman.factory.machine.diskSize': '250000000000', // 250GB = 232.83GiB
+    'podman.factory.machine.provider': LIBKRUN_LABEL,
+  });
+  expect(auditRecords.records).toEqual(condition.arrayContaining([expect.objectContaining({ type: 'error' })]));
+}
+
+describe.each(['windows', 'mac', 'linux'])('podman machine properties audit on %s', os => {
+  beforeEach(() => {
+    vi.mocked(util.isMac).mockReturnValue(os === 'mac');
+    vi.mocked(util.isWindows).mockReturnValue(os === 'windows');
+    vi.mocked(util.isLinux).mockReturnValue(os === 'linux');
+  });
+  if (os === 'linux') {
+    test('is not used', async () => {
+      const orExistsSync = fs.existsSync;
+      vi.spyOn(fs, 'existsSync').mockImplementation((path: fs.PathLike) => {
+        if (path.toString().endsWith('/podman/podman.sock')) {
+          console.log('========>', path);
+          return true;
+        }
+        return orExistsSync(path);
+      });
+      await extension.activate(mockExtensionForAuditTests());
+      expect(vi.mocked(provider.setContainerProviderConnectionFactory)).not.toBeCalled();
+    });
+    return;
+  }
+  test(`reports error for image path and uri is used at the same time`, async () => {
+    await testAudit('path', 'registry/repo/image:version', expect);
+  });
+  test(`reports no error for image path only is used`, async () => {
+    await testAudit('path', '', expect.not);
+  });
+  test(`reports no error for image uri only is used`, async () => {
+    await testAudit('', 'uri', expect.not);
+  });
+});
+
+test('isHypervEnabled should return false if it is not windows', async () => {
+  vi.mocked(isWindows).mockReturnValue(false);
+  const hypervEnabled = await extension.isHyperVEnabled();
+  expect(hypervEnabled).toBeFalsy();
+});
+
+test('isHypervEnabled should return false if hyperv is not enabled', async () => {
+  vi.mocked(isWindows).mockReturnValue(true);
+  const hypervEnabled = await extension.isHyperVEnabled();
+  expect(hypervEnabled).toBeFalsy();
+});
+
+test('isHypervEnabled should return true if hyperv is enabled', async () => {
+  vi.mocked(isWindows).mockReturnValue(true);
+  vi.spyOn(podmanCli, 'getPodmanInstallation').mockResolvedValue({
+    version: '5.2.1',
+  });
+  vi.spyOn(extensionApi.process, 'exec').mockImplementation((command, args) => {
+    return new Promise<extensionApi.RunResult>(resolve => {
+      if (command === 'powershell.exe') {
+        resolve({
+          stdout: args?.[0] === '@(Get-Service vmms).Status' ? 'Running' : 'True',
+          stderr: '',
+          command: 'command',
+        });
+      }
+    });
+  });
+  const wslHypervEnabled = await extension.isHyperVEnabled();
+  expect(wslHypervEnabled).toBeTruthy();
+});
+
+test('isWSLEnabled should return false if it is not windows', async () => {
+  vi.mocked(isWindows).mockReturnValue(false);
+  const wslEnabled = await extension.isWSLEnabled();
+  expect(wslEnabled).toBeFalsy();
+});
+
+test('isWSLEnabled should return false if wsl is not enabled', async () => {
+  vi.mocked(isWindows).mockReturnValue(true);
+  vi.spyOn(extensionApi.process, 'exec').mockResolvedValue({
+    stdout: 'unknown message: 1.2.5.0',
+    stderr: '',
+    command: 'command',
+  });
+  const wslEnabled = await extension.isWSLEnabled();
+  expect(wslEnabled).toBeFalsy();
+});
+
+test('isWSLEnabled should return true if wsl is enabled', async () => {
+  vi.mocked(isWindows).mockReturnValue(true);
+  vi.spyOn(extensionApi.process, 'exec').mockImplementation(command => {
+    return new Promise<extensionApi.RunResult>(resolve => {
+      if (command === 'wsl') {
+        resolve({
+          stdout:
+            'WSL version: 2.2.5.0\nKernel version: 5.15.90.1\nWSLg version: 1.0.51\nMSRDC version: 1.2.3770\nDirect3D version: 1.608.2-61064218\nDXCore version: 10.0.25131.1002-220531-1700.rs-onecore-base2-hyp\nWindows version: 10.0.22621.2134',
+          stderr: '',
+          command: 'command',
+        });
+      }
+      if (command === 'powershell.exe') {
+        resolve({
+          stdout: 'True',
+          stderr: '',
+          command: 'command',
+        });
+      }
+    });
+  });
+  const wslEnabled = await extension.isWSLEnabled();
+  expect(wslEnabled).toBeTruthy();
+});
+
+test('getJSONMachineList should only get machines from wsl if hyperv is not enabled', async () => {
+  vi.mocked(isWindows).mockReturnValue(true);
+  vi.mocked(isMac).mockReturnValue(false);
+  vi.spyOn(extensionApi.process, 'exec').mockImplementation((command, args) => {
+    return new Promise<extensionApi.RunResult>(resolve => {
+      if (command !== 'wsl' && args?.[0] === '--version') {
+        resolve({
+          stdout: 'podman version 5.1.1',
+        } as extensionApi.RunResult);
+      }
+      if (command === 'wsl') {
+        resolve({
+          stdout:
+            'WSL version: 2.2.5.0\nKernel version: 5.15.90.1\nWSLg version: 1.0.51\nMSRDC version: 1.2.3770\nDirect3D version: 1.608.2-61064218\nDXCore version: 10.0.25131.1002-220531-1700.rs-onecore-base2-hyp\nWindows version: 10.0.22621.2134',
+          stderr: '',
+          command: 'command',
+        });
+      }
+      if (command === 'powershell.exe') {
+        resolve({
+          stdout: 'True',
+          stderr: '',
+          command: 'command',
+        });
+      }
+    });
+  });
+  const fakeJSON: extension.MachineJSON[] = [
+    {
+      Name: 'podman-machine-default',
+      CPUs: 2,
+      Memory: '1048000000',
+      DiskSize: '250000000000',
+      Running: true,
+      Starting: false,
+      Default: true,
+      VMType: VMTYPE.LIBKRUN,
+      Port: 123,
+      RemoteUsername: 'user',
+      IdentityPath: '/path/to/key',
+    },
+    {
+      Name: 'podman-machine-1',
+      CPUs: 2,
+      Memory: '1048000000',
+      DiskSize: '250000000000',
+      Running: false,
+      Starting: false,
+      Default: false,
+      VMType: VMTYPE.LIBKRUN,
+      Port: 123,
+      RemoteUsername: 'user',
+      IdentityPath: '/path/to/key',
+    },
+  ];
+  const execPodmanSpy = vi.spyOn(util, 'execPodman').mockResolvedValue({
+    stdout: JSON.stringify(fakeJSON),
+    stderr: '',
+    command: '',
+  });
+  await extension.getJSONMachineList();
+  expect(execPodmanSpy).toBeCalledWith(['machine', 'list', '--format', 'json'], 'wsl');
+});
+
+test('getJSONMachineList should only get machines from hyperv if wsl is not enabled', async () => {
+  vi.mocked(isWindows).mockReturnValue(true);
+  vi.mocked(isMac).mockReturnValue(false);
+  vi.spyOn(podmanCli, 'getPodmanInstallation').mockResolvedValue({
+    version: '5.2.1',
+  });
+  vi.spyOn(extensionApi.process, 'exec').mockImplementation((command, args) => {
+    return new Promise<extensionApi.RunResult>(resolve => {
+      if (command !== 'wsl' && args?.[0] === '--version') {
+        resolve({
+          stdout: 'podman version 5.2.1',
+        } as extensionApi.RunResult);
+      }
+      if (command === 'wsl') {
+        resolve({
+          stdout: 'WSL version: invalid',
+          stderr: '',
+          command: 'command',
+        });
+      }
+      if (command === 'powershell.exe') {
+        resolve({
+          stdout: args?.[0] === '@(Get-Service vmms).Status' ? 'Running' : 'True',
+          stderr: '',
+          command: 'command',
+        });
+      }
+    });
+  });
+  const fakeJSON: extension.MachineJSON[] = [
+    {
+      Name: 'podman-machine-default',
+      CPUs: 2,
+      Memory: '1048000000',
+      DiskSize: '250000000000',
+      Running: true,
+      Starting: false,
+      Default: true,
+      VMType: VMTYPE.LIBKRUN,
+      Port: 123,
+      RemoteUsername: 'user',
+      IdentityPath: '/path/to/key',
+    },
+    {
+      Name: 'podman-machine-1',
+      CPUs: 2,
+      Memory: '1048000000',
+      DiskSize: '250000000000',
+      Running: false,
+      Starting: false,
+      Default: false,
+      VMType: VMTYPE.LIBKRUN,
+      Port: 123,
+      RemoteUsername: 'user',
+      IdentityPath: '/path/to/key',
+    },
+  ];
+  const execPodmanSpy = vi.spyOn(util, 'execPodman').mockResolvedValue({
+    stdout: JSON.stringify(fakeJSON),
+    stderr: '',
+    command: '',
+  });
+  await extension.getJSONMachineList();
+  expect(execPodmanSpy).toBeCalledWith(['machine', 'list', '--format', 'json'], 'hyperv');
+});
+
+test('getJSONMachineList should get machines from hyperv and wsl if both are enabled', async () => {
+  vi.mocked(isWindows).mockReturnValue(true);
+  vi.mocked(isMac).mockReturnValue(false);
+  vi.spyOn(podmanCli, 'getPodmanInstallation').mockResolvedValue({
+    version: '5.2.1',
+  });
+  vi.spyOn(extensionApi.process, 'exec').mockImplementation((command, args) => {
+    return new Promise<extensionApi.RunResult>(resolve => {
+      if (command !== 'wsl' && args?.[0] === '--version') {
+        resolve({
+          stdout: 'podman version 5.2.1',
+        } as extensionApi.RunResult);
+      }
+      if (command === 'wsl') {
+        resolve({
+          stdout:
+            'WSL version: 2.2.5.0\nKernel version: 5.15.90.1\nWSLg version: 1.0.51\nMSRDC version: 1.2.3770\nDirect3D version: 1.608.2-61064218\nDXCore version: 10.0.25131.1002-220531-1700.rs-onecore-base2-hyp\nWindows version: 10.0.22621.2134',
+          stderr: '',
+          command: 'command',
+        });
+      }
+      if (command === 'powershell.exe') {
+        resolve({
+          stdout: args?.[0] === '@(Get-Service vmms).Status' ? 'Running' : 'True',
+          stderr: '',
+          command: 'command',
+        });
+      }
+    });
+  });
+  const fakeJSON: extension.MachineJSON[] = [
+    {
+      Name: 'podman-machine-default',
+      CPUs: 2,
+      Memory: '1048000000',
+      DiskSize: '250000000000',
+      Running: true,
+      Starting: false,
+      Default: true,
+      VMType: VMTYPE.LIBKRUN,
+      Port: 123,
+      RemoteUsername: 'user',
+      IdentityPath: '/path/to/key',
+    },
+    {
+      Name: 'podman-machine-1',
+      CPUs: 2,
+      Memory: '1048000000',
+      DiskSize: '250000000000',
+      Running: false,
+      Starting: false,
+      Default: false,
+      VMType: VMTYPE.LIBKRUN,
+      Port: 123,
+      RemoteUsername: 'user',
+      IdentityPath: '/path/to/key',
+    },
+  ];
+  const execPodmanSpy = vi.spyOn(util, 'execPodman').mockResolvedValue({
+    stdout: JSON.stringify(fakeJSON),
+    stderr: '',
+    command: '',
+  });
+  await extension.getJSONMachineList();
+  expect(execPodmanSpy).toHaveBeenNthCalledWith(1, ['machine', 'list', '--format', 'json'], 'wsl');
+  expect(execPodmanSpy).toHaveBeenNthCalledWith(2, ['machine', 'list', '--format', 'json'], 'hyperv');
+});
+
+describe('updateWSLHyperVEnabledValue', () => {
+  beforeEach(() => {
+    extension.updateWSLHyperVEnabledContextValue(true);
+    vi.resetAllMocks();
+  });
+  test('setValue should be called if new value is different than wslAndHypervEnabled', async () => {
+    extension.updateWSLHyperVEnabledContextValue(false);
+    expect(extensionApi.context.setValue).toBeCalledWith(extension.WSL_HYPERV_ENABLED_KEY, false);
+  });
+  test('setValue should not be called if new value is equal to wslAndHypervEnabled', async () => {
+    extension.updateWSLHyperVEnabledContextValue(true);
+    expect(extensionApi.context.setValue).not.toBeCalled();
+  });
+});
+
+describe('connectionAuditor', () => {
+  test('check if podman.isCreateWSLOptionSelected is set to true if podman.factory.machine.win.provider = wsl', async () => {
+    // be sure isCreateWSLOptionSelected is set to false
+    await extension.connectionAuditor({
+      'podman.factory.machine.win.provider': 'hyperv',
+    });
+
+    // verify isCreateWSLOptionSelected is set to true
+    await extension.connectionAuditor({
+      'podman.factory.machine.win.provider': 'wsl',
+    });
+    expect(extensionApi.context.setValue).toHaveBeenLastCalledWith(
+      extension.CREATE_WSL_MACHINE_OPTION_SELECTED_KEY,
+      true,
+    );
+  });
+  test('check if podman.isCreateWSLOptionSelected is set to true if podman.factory.machine.win.provider is undefined but wsl is enabled', async () => {
+    // be sure isCreateWSLOptionSelected is set to false
+    await extension.connectionAuditor({
+      'podman.factory.machine.win.provider': 'hyperv',
+    });
+
+    // verify isCreateWSLOptionSelected is set to true
+    extension.setWSLEnabled(true);
+
+    await extension.connectionAuditor({
+      'podman.factory.machine.win.provider': undefined,
+    });
+    expect(extensionApi.context.setValue).toHaveBeenLastCalledWith(
+      extension.CREATE_WSL_MACHINE_OPTION_SELECTED_KEY,
+      true,
+    );
+  });
+  test('check if podman.isCreateWSLOptionSelected is set to false if podman.factory.machine.win.provider = hyperv', async () => {
+    // be sure isCreateWSLOptionSelected is set to true
+    await extension.connectionAuditor({
+      'podman.factory.machine.win.provider': 'wsl',
+    });
+
+    // verify isCreateWSLOptionSelected is set to false
+    await extension.connectionAuditor({
+      'podman.factory.machine.win.provider': 'hyperv',
+    });
+    expect(extensionApi.context.setValue).toHaveBeenLastCalledWith(
+      extension.CREATE_WSL_MACHINE_OPTION_SELECTED_KEY,
+      false,
+    );
+  });
+  test('check if podman.isCreateWSLOptionSelected is set to false if podman.factory.machine.win.provider is undefined and wsl is NOT enabled', async () => {
+    // be sure isCreateWSLOptionSelected is set to true
+    await extension.connectionAuditor({
+      'podman.factory.machine.win.provider': 'wsl',
+    });
+
+    // verify isCreateWSLOptionSelected is set to false
+    extension.setWSLEnabled(false);
+
+    await extension.connectionAuditor({
+      'podman.factory.machine.win.provider': undefined,
+    });
+    expect(extensionApi.context.setValue).toHaveBeenLastCalledWith(
+      extension.CREATE_WSL_MACHINE_OPTION_SELECTED_KEY,
+      false,
+    );
+  });
 });

@@ -65,8 +65,6 @@ async function addElectronFuses(context) {
   });
 }
 
-const DEFAULT_ASSETS = ['packages/main/src/assets/**'];
-
 /**
  * @type {import('electron-builder').Configuration}
  * @see https://www.electron.build/configuration/configuration
@@ -80,25 +78,29 @@ const config = {
   },
   buildDependenciesFromSource: false,
   npmRebuild: false,
-  beforePack: async (context) => {
+  beforePack: async context => {
+    const DEFAULT_ASSETS = ['packages/main/src/assets/**'];
     context.packager.config.extraResources = DEFAULT_ASSETS;
 
     // universal build, add both pkg files
     // this is hack to avoid issue https://github.com/electron/universal/issues/36
-    if(context.appOutDir.endsWith('mac-universal-x64-temp') || context.appOutDir.endsWith('mac-universal-arm64-temp')){
-      context.packager.config.extraResources  = DEFAULT_ASSETS;
-      context.packager.config.extraResources.push('extensions/podman/assets/podman-installer-macos-universal*.pkg');
+    if (
+      context.appOutDir.endsWith('mac-universal-x64-temp') ||
+      context.appOutDir.endsWith('mac-universal-arm64-temp')
+    ) {
+      context.packager.config.extraResources = DEFAULT_ASSETS;
+      context.packager.config.extraResources.push('extensions/podman/packages/extension/assets/podman-installer-macos-universal*.pkg');
       return;
     }
 
-    if(context.arch === Arch.arm64 && context.electronPlatformName === 'darwin'){
-      context.packager.config.extraResources.push('extensions/podman/assets/podman-installer-macos-aarch64-*.pkg');
-      context.packager.config.extraResources.push('extensions/podman/assets/podman-image-arm64.zst');
+    if (context.arch === Arch.arm64 && context.electronPlatformName === 'darwin') {
+      context.packager.config.extraResources.push('extensions/podman/packages/extension/assets/podman-installer-macos-aarch64-*.pkg');
+      context.packager.config.extraResources.push('extensions/podman/packages/extension/assets/podman-image-arm64.zst');
     }
 
-    if(context.arch === Arch.x64 && context.electronPlatformName === 'darwin'){
-      context.packager.config.extraResources.push('extensions/podman/assets/podman-installer-macos-amd64-*.pkg');
-      context.packager.config.extraResources.push('extensions/podman/assets/podman-image-x64.zst');
+    if (context.arch === Arch.x64 && context.electronPlatformName === 'darwin') {
+      context.packager.config.extraResources.push('extensions/podman/packages/extension/assets/podman-installer-macos-amd64-*.pkg');
+      context.packager.config.extraResources.push('extensions/podman/packages/extension/assets/podman-image-x64.zst');
     }
 
     if (context.electronPlatformName === 'win32') {
@@ -108,13 +110,13 @@ const config = {
         to: 'win-ca/roots.exe',
       });
       // add podman installer
-      context.packager.config.extraResources.push('extensions/podman/assets/podman-*.exe');
+      context.packager.config.extraResources.push('extensions/podman/packages/extension/assets/podman-*.exe');
     }
     if (context.arch === Arch.x64 && context.electronPlatformName === 'win32') {
-      context.packager.config.extraResources.push('extensions/podman/assets/podman-image-x64.tar.zst');
+      context.packager.config.extraResources.push('extensions/podman/packages/extension/assets/podman-image-x64.tar.zst');
     }
     if (context.arch === Arch.arm64 && context.electronPlatformName === 'win32') {
-      context.packager.config.extraResources.push('extensions/podman/assets/podman-image-arm64.tar.zst');
+      context.packager.config.extraResources.push('extensions/podman/packages/extension/assets/podman-image-arm64.tar.zst');
     }
   },
   afterPack: async context => {
@@ -202,12 +204,12 @@ const config = {
   protocols: {
     name: 'Podman Desktop',
     schemes: ['podman-desktop'],
-    role: "Editor"
+    role: 'Editor',
   },
   publish: {
     provider: 'github',
     timeout: 10000,
-  }
+  },
   /*extraMetadata: {
     version: process.env.VITE_APP_VERSION,
   },*/
@@ -217,14 +219,14 @@ const config = {
 if (process.env.AIRGAP_DOWNLOAD) {
   config.publish = {
     publishAutoUpdate: false,
-    provider: 'github'
+    provider: 'github',
   };
 }
 
 if (process.env.APPLE_TEAM_ID) {
   config.mac.notarize = {
     teamId: process.env.APPLE_TEAM_ID,
-  }
+  };
 }
 
 const azureCodeSign = filePath => {

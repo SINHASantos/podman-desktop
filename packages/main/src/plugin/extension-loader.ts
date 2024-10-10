@@ -695,7 +695,7 @@ export class ExtensionLoader {
       extensionConfiguration.title = `Extension: ${extensionConfiguration.title}`;
       extensionConfiguration.id = 'preferences.' + extension.id;
 
-      extension.subscriptions.push(this.configurationRegistry.registerConfigurations([extensionConfiguration]));
+      this.configurationRegistry.registerConfigurations([extensionConfiguration]);
     }
 
     const extensionCommands = extension.manifest?.contributes?.commands;
@@ -983,7 +983,18 @@ export class ExtensionLoader {
           token: containerDesktopAPI.CancellationToken,
         ) => Promise<R>,
       ): Promise<R> => {
-        return progress.withProgress(options, task);
+        return progress.withProgress(
+          {
+            ...options,
+            details: options.details
+              ? {
+                  routeArgs: options.details.routeArgs,
+                  routeId: `${extensionInfo.id}.${options.details.routeId}`,
+                }
+              : undefined,
+          },
+          task,
+        );
       },
 
       showNotification: (notificationInfo: containerDesktopAPI.NotificationOptions): containerDesktopAPI.Disposable => {
@@ -1419,6 +1430,19 @@ export class ExtensionLoader {
         connection: containerDesktopAPI.ProviderContainerConnection,
       ): Promise<void> => {
         await this.navigationManager.navigateToEditProviderContainerConnection(connection);
+      },
+      navigate: async (routeId: string, ...args: unknown[]): Promise<void> => {
+        return this.navigationManager.navigateToRoute(`${extensionInfo.id}.${routeId}`, args);
+      },
+      register: (routeId: string, commandId: string): Disposable => {
+        const disposable = this.navigationManager.registerRoute({
+          routeId: `${extensionInfo.id}.${routeId}`,
+          commandId: commandId,
+        });
+
+        disposables.push(disposable);
+
+        return disposable;
       },
     };
 

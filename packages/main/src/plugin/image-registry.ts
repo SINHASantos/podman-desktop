@@ -114,7 +114,10 @@ export class ImageRegistry {
   }
 
   getAuthconfigForServer(registryServer: string): Dockerode.AuthConfig | undefined {
-    const matchingUrl = registryServer;
+    let matchingUrl = registryServer;
+    if (matchingUrl === 'index.docker.io') {
+      matchingUrl = 'docker.io';
+    }
     // grab authentication data for this server
     const matchingRegistry = this.getRegistries().find(
       registry => registry.serverUrl.toLowerCase() === matchingUrl.toLowerCase(),
@@ -689,7 +692,7 @@ export class ImageRegistry {
         platformOs = 'windows';
       }
       // find the manifest corresponding to our platform
-      const matchedManifest = this.getBestManifest(
+      const matchedManifest = this.findBestManifest(
         parsedManifest.manifests.filter(
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           (m: any) =>
@@ -715,7 +718,7 @@ export class ImageRegistry {
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  getBestManifest(manifests: any[], wantedArch: string, wantedOs: string): any {
+  findBestManifest(manifests: any[], wantedArch: string, wantedOs: string): any | undefined {
     // eslint-disable-next-line etc/no-commented-out-code
     // manifestsMap [os] [arch] = manifest
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -736,14 +739,16 @@ export class ImageRegistry {
     if (!wantedOses) {
       wantedOses = manifestsMap.get('linux');
     }
-    if (!wantedOses) {
+
+    const keys = Array.from(wantedOses?.keys() ?? []);
+    if (!wantedOses || !keys[0]) {
       return;
     }
 
     let wanted = wantedOses.get(wantedArch);
     if (!wanted) {
       if (wantedOses.size === 1) {
-        wanted = wantedOses.get(wantedOses.keys().next().value);
+        wanted = wantedOses.get(keys[0]);
       } else {
         wanted = wantedOses.get('amd64');
       }
@@ -921,20 +926,24 @@ export class ImageRegistry {
   }
 
   async searchImages(options: ImageSearchOptions): Promise<ImageSearchResult[]> {
-    if (!options.registry) {
-      options.registry = 'https://index.docker.io';
+    try {
+      if (!options.registry) {
+        options.registry = 'https://index.docker.io';
+      }
+      if (options.registry === 'docker.io') {
+        options.registry = 'index.docker.io';
+      }
+      if (!options.registry.startsWith('http')) {
+        options.registry = 'https://' + options.registry;
+      }
+      const resultJSON = await got.get(
+        `${options.registry}/v1/search?q=${options.query}&n=${options.limit ?? 25}`,
+        this.getOptions(),
+      );
+      return JSON.parse(resultJSON.body).results;
+    } catch (e: unknown) {
+      throw new Error(`searching images. ${String(e)}`);
     }
-    if (options.registry === 'docker.io') {
-      options.registry = 'index.docker.io';
-    }
-    if (!options.registry.startsWith('http')) {
-      options.registry = 'https://' + options.registry;
-    }
-    const resultJSON = await got.get(
-      `${options.registry}/v1/search?q=${options.query}&n=${options.limit ?? 25}`,
-      this.getOptions(),
-    );
-    return JSON.parse(resultJSON.body).results;
   }
 
   async listImageTags(options: ImageTagsListOptions): Promise<string[]> {
@@ -955,8 +964,7 @@ export class ImageRegistry {
       const catalog = await got.get(`${imageData.registryURL}/${imageData.name}/tags/list`, opts);
       return JSON.parse(catalog.body).tags;
     } catch (e: unknown) {
-      console.error('error getting tags of image', options.image, e);
-      return [];
+      throw new Error(`getting tags of image ${options.image}. ${String(e)}`);
     }
   }
 }

@@ -16,19 +16,25 @@
  * SPDX-License-Identifier: Apache-2.0
  ***********************************************************************/
 
-import * as os from 'node:os';
-
 import { expect as playExpect, test } from '../utility/fixtures';
-import { deletePodmanMachine } from '../utility/operations';
+import { createPodmanMachineFromCLI, deletePodmanMachine } from '../utility/operations';
+import { isLinux, isMac } from '../utility/platform';
+import { waitForPodmanMachineStartup } from '../utility/wait';
 
 const PODMAN_MACHINE_NAME: string = 'podman-machine-default';
 
 test.skip(
-  os.platform() === 'linux' || process.env.TEST_PODMAN_MACHINE !== 'true',
-  'Tests suite should not run on Linux platform',
+  isLinux || process.env.TEST_PODMAN_MACHINE !== 'true',
+  'Tests suite should not run on Linux platform or if TEST_PODMAN_MACHINE is not true',
+);
+
+test.skip(
+  isMac,
+  'Due to issue https://github.com/containers/podman-desktop/issues/8984 which causes problems on cicd on macOs this test suite is deactived on macs until a fix is provided',
 );
 
 test.beforeAll(async ({ runner, welcomePage, page }) => {
+  test.setTimeout(120_000);
   runner.setVideoAndTraceName('podman-machine-dashboard');
   await welcomePage.handleWelcomePage(true);
 
@@ -36,11 +42,18 @@ test.beforeAll(async ({ runner, welcomePage, page }) => {
     (process.env.TEST_PODMAN_MACHINE !== undefined && process.env.TEST_PODMAN_MACHINE === 'true') ||
     (process.env.MACHINE_CLEANUP !== undefined && process.env.MACHINE_CLEANUP === 'true')
   ) {
+    await waitForPodmanMachineStartup(page);
     await deletePodmanMachine(page, PODMAN_MACHINE_NAME);
   }
 });
 
 test.afterAll(async ({ runner }) => {
+  test.setTimeout(120_000);
+
+  if (test.info().status === 'failed') {
+    await createPodmanMachineFromCLI();
+  }
+
   await runner.close();
 });
 

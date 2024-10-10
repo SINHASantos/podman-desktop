@@ -31,6 +31,7 @@ let lastState = $state('');
 let containerState = $state(container);
 
 $effect(() => {
+  containerState = container;
   if (lastState === 'STARTING' && containerState.state === 'RUNNING') {
     restartTerminal();
   }
@@ -158,7 +159,11 @@ onDestroy(() => {
 });
 </script>
 
-<div class="h-full" bind:this={terminalXtermDiv} class:hidden={container.state !== 'RUNNING'}></div>
+<div
+  class="h-full p-[5px] pr-0 bg-[var(--pd-terminal-background)]"
+  bind:this={terminalXtermDiv}
+  class:hidden={container.state !== 'RUNNING'}>
+</div>
 
 <EmptyScreen
   hidden={container.state === 'RUNNING'}

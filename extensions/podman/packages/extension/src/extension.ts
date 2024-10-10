@@ -26,6 +26,8 @@ import type { ContainerEngineInfo, RunError } from '@podman-desktop/api';
 import * as extensionApi from '@podman-desktop/api';
 import { compareVersions } from 'compare-versions';
 
+import type { PodmanExtensionApi, PodmanRunOptions } from '../../api/src/podman-extension-api';
+import { SequenceCheck } from './base-check';
 import { getSocketCompatibility } from './compatibility-mode';
 import { getDetectionChecks } from './detection-checks';
 import { KrunkitHelper } from './krunkit-helper';
@@ -36,8 +38,9 @@ import type { InstalledPodman } from './podman-cli';
 import { getPodmanCli, getPodmanInstallation } from './podman-cli';
 import { PodmanConfiguration } from './podman-configuration';
 import { PodmanInfoHelper } from './podman-info-helper';
-import { PodmanInstall } from './podman-install';
+import { HyperVCheck, PodmanInstall, WSL2Check, WSLVersionCheck } from './podman-install';
 import { PodmanRemoteConnections } from './podman-remote-connections';
+import { QemuHelper } from './qemu-helper';
 import { RegistrySetup } from './registry-setup';
 import {
   appConfigDir,
@@ -73,7 +76,7 @@ let defaultConnectionNotify = !isLinux();
 let defaultMachineMonitor = true;
 
 // current status of machines
-const podmanMachinesStatuses = new Map<string, extensionApi.ProviderConnectionStatus>();
+export const podmanMachinesStatuses = new Map<string, extensionApi.ProviderConnectionStatus>();
 let podmanProviderStatus: extensionApi.ProviderConnectionStatus = 'started';
 const podmanMachinesInfo = new Map<string, MachineInfo>();
 const currentConnections = new Map<string, extensionApi.Disposable>();
@@ -89,9 +92,14 @@ const configurationCompatibilityMode = 'setting.dockerCompatibility';
 let telemetryLogger: extensionApi.TelemetryLogger | undefined;
 
 const wslHelper = new WslHelper();
+const qemuHelper = new QemuHelper();
 const krunkitHelper = new KrunkitHelper();
 const podmanBinaryHelper = new PodmanBinaryLocationHelper();
 const podmanInfoHelper = new PodmanInfoHelper();
+
+let createWSLMachineOptionSelected = false;
+let wslAndHypervEnabledContextValue = false;
+let wslEnabled = false;
 
 let shouldNotifySetup = true;
 const setupPodmanNotification: extensionApi.NotificationOptions = {
@@ -114,6 +122,9 @@ export type MachineJSON = {
   Default: boolean;
   VMType: string;
   UserModeNetworking?: boolean;
+  Port: number;
+  RemoteUsername: string;
+  IdentityPath: string;
 };
 
 export type ConnectionJSON = {
@@ -134,6 +145,9 @@ export type MachineInfo = {
   diskUsage: number;
   memoryUsage: number;
   vmType: string;
+  port: number;
+  remoteUsername: string;
+  identityPath: string;
 };
 
 export type MachineListOutput = {
@@ -237,16 +251,16 @@ export async function updateMachines(
     const running = machine?.Running === true;
     let status: extensionApi.ProviderConnectionStatus = running ? 'started' : 'stopped';
 
-    // update the status to starting if the machine is starting but not yet running
+    // update the status to starting if the machine is running but still starting
     const starting = machine?.Starting === true;
-    if (!running && starting) {
+    if (starting) {
       status = 'starting';
     }
 
     let machineInfo: ContainerEngineInfo | undefined = undefined;
     if (running) {
       try {
-        machineInfo = await extensionApi.containerEngine.info(`podman.${prettyMachineName(machine.Name)}`);
+        machineInfo = await extensionApi.containerEngine.info(`podman.${machine.Name}`);
       } catch (err: unknown) {
         console.warn(` Can't get machine ${machine.Name} resource usage error ${err}`);
       }
@@ -276,6 +290,9 @@ export async function updateMachines(
           ? (machineInfo?.memoryUsed * 100) / machineInfo?.memory
           : 0,
       vmType: machine.VMType,
+      port: machine.Port,
+      remoteUsername: machine.RemoteUsername,
+      identityPath: machine.IdentityPath,
     });
 
     if (!podmanMachinesStatuses.has(machine.Name)) {
@@ -363,7 +380,13 @@ export async function updateMachines(
         provider.updateStatus('installed');
       }
     } else {
-      const atLeastOneMachineRunning = machines.some(machine => machine.Running);
+      /*
+       * The machine can have 3 states, based on `Starting` and `Running` fields:
+       * - !Running && !Starting -> configured
+       * -  Running &&  Starting -> starting
+       * -  Running && !Starting -> ready
+       */
+      const atLeastOneMachineRunning = machines.some(machine => machine.Running && !machine.Starting);
       const atLeastOneMachineStarting = machines.some(machine => machine.Starting);
       // if a machine is running it's started else it is ready
       if (atLeastOneMachineRunning) {
@@ -1010,6 +1033,8 @@ export const PODMAN_MACHINE_CPU_SUPPORTED_KEY = 'podman.podmanMachineCpuSupporte
 export const PODMAN_MACHINE_MEMORY_SUPPORTED_KEY = 'podman.podmanMachineMemorySupported';
 export const PODMAN_MACHINE_DISK_SUPPORTED_KEY = 'podman.podmanMachineDiskSupported';
 export const PODMAN_PROVIDER_LIBKRUN_SUPPORTED_KEY = 'podman.isLibkrunSupported';
+export const CREATE_WSL_MACHINE_OPTION_SELECTED_KEY = 'podman.isCreateWSLOptionSelected';
+export const WSL_HYPERV_ENABLED_KEY = 'podman.wslHypervEnabled';
 
 export function initTelemetryLogger(): void {
   telemetryLogger = extensionApi.env.createTelemetryLogger();
@@ -1244,7 +1269,11 @@ export function registerOnboardingRemoveUnsupportedMachinesCommand(): extensionA
   });
 }
 
-export async function activate(extensionContext: extensionApi.ExtensionContext): Promise<void> {
+async function exec(args: string[], options?: PodmanRunOptions): Promise<extensionApi.RunResult> {
+  return execPodman(args, options?.connection?.connection.vmTypeDisplayName, options);
+}
+
+export async function activate(extensionContext: extensionApi.ExtensionContext): Promise<PodmanExtensionApi> {
   initExtensionContext(extensionContext);
 
   initTelemetryLogger();
@@ -1259,6 +1288,9 @@ export async function activate(extensionContext: extensionApi.ExtensionContext):
     extensionApi.context.setValue(START_NOW_MACHINE_INIT_SUPPORTED_KEY, isStartNowAtMachineInitSupported(version));
     extensionApi.context.setValue(USER_MODE_NETWORKING_SUPPORTED_KEY, isUserModeNetworkingSupported(version));
     extensionApi.context.setValue(PODMAN_PROVIDER_LIBKRUN_SUPPORTED_KEY, isLibkrunSupported(version));
+    wslEnabled = await isWSLEnabled();
+    const isWslAndHyperEnabled = wslEnabled && (await isHyperVEnabled());
+    updateWSLHyperVEnabledContextValue(isWslAndHyperEnabled);
     isMovedPodmanSocket = isPodmanSocketLocationMoved(version);
   }
 
@@ -1475,11 +1507,18 @@ export async function activate(extensionContext: extensionApi.ExtensionContext):
   // create machines on Linux via Podman Desktop, however we will still support
   // the lifecycle management of one.
   if (isMac() || isWindows()) {
-    provider.setContainerProviderConnectionFactory({
-      initialize: () => createMachine({}),
-      create: createMachine,
-      creationDisplayName: 'Podman machine',
-    });
+    provider.setContainerProviderConnectionFactory(
+      {
+        initialize: () => createMachine({}),
+        create: createMachine,
+        creationDisplayName: 'Podman machine',
+      },
+      {
+        auditItems: async (items: extensionApi.AuditRequestItems) => {
+          return await connectionAuditor(items);
+        },
+      },
+    );
   }
 
   // Linux has native container support (no need for Podman Machine), so we don't need to create machines.
@@ -1652,23 +1691,50 @@ export async function activate(extensionContext: extensionApi.ExtensionContext):
   const registrySetup = new RegistrySetup();
   await registrySetup.setup();
 
-  await calcPodmanMachineSetting(podmanConfiguration);
+  await calcPodmanMachineSetting();
 
   const podmanRemoteConnections = new PodmanRemoteConnections(extensionContext, provider);
   podmanRemoteConnections.start();
+
+  return {
+    exec,
+  };
 }
 
-export async function calcPodmanMachineSetting(podmanConfiguration: PodmanConfiguration): Promise<void> {
+export async function connectionAuditor(items: extensionApi.AuditRequestItems): Promise<extensionApi.AuditResult> {
+  const records: extensionApi.AuditRecord[] = [];
+
+  if (items['podman.factory.machine.image-uri'] && items['podman.factory.machine.image-path']) {
+    records.push({
+      type: 'error',
+      record: `'Image Path' and 'Image URI' fields are both filled. Please fill only one or leave both fields empty.`,
+    });
+  }
+
+  const winProvider = items['podman.factory.machine.win.provider'];
+  // set createWSLMachineOptionSelected if the user actively selected wsl from the list in the UI, or
+  // if the list is not visible (so only one provider is active) and the provider is wsl
+  const isWSL = winProvider === 'wsl' || (winProvider === undefined && wslEnabled);
+  if (createWSLMachineOptionSelected !== isWSL) {
+    createWSLMachineOptionSelected = isWSL;
+    extensionApi.context.setValue(CREATE_WSL_MACHINE_OPTION_SELECTED_KEY, createWSLMachineOptionSelected);
+  }
+
+  return {
+    records,
+  };
+}
+
+export async function calcPodmanMachineSetting(): Promise<void> {
   let cpuSupported = true;
   let memorySupported = true;
   let diskSupported = true;
 
   if (isWindows()) {
-    const isPodmanHyperv_Env = process.env.CONTAINERS_MACHINE_PROVIDER === 'hyperv';
-    const isPodmanHyperv_Config = await podmanConfiguration.matchRegexpInContainersConfig(/provider\s*=\s*"hyperv"/);
-    cpuSupported = isPodmanHyperv_Env || isPodmanHyperv_Config;
-    memorySupported = isPodmanHyperv_Env || isPodmanHyperv_Config;
-    diskSupported = isPodmanHyperv_Env || isPodmanHyperv_Config;
+    const isHyperV = await isHyperVEnabled();
+    cpuSupported = isHyperV;
+    memorySupported = isHyperV;
+    diskSupported = isHyperV;
   }
 
   extensionApi.context.setValue(PODMAN_MACHINE_CPU_SUPPORTED_KEY, cpuSupported);
@@ -1722,7 +1788,24 @@ export async function getJSONMachineList(): Promise<MachineJSONListOutput> {
   // if libkrun is supported we want to show both applehv and libkrun machines
   if (installedPodman && isLibkrunSupported(installedPodman.version)) {
     containerMachineProviders.push(...['applehv', 'libkrun']);
+  }
+
+  let hypervEnabled = false;
+  if (await isWSLEnabled()) {
+    wslEnabled = true;
+    containerMachineProviders.push('wsl');
   } else {
+    wslEnabled = false;
+  }
+
+  if (await isHyperVEnabled()) {
+    hypervEnabled = true;
+    containerMachineProviders.push('hyperv');
+  }
+  // update context "wsl-hyperv enabled" value
+  updateWSLHyperVEnabledContextValue(wslEnabled && hypervEnabled);
+
+  if (containerMachineProviders.length === 0) {
     // in all other cases we set undefined so that it executes normally by using the default container provider
     containerMachineProviders.push(undefined);
   }
@@ -1785,6 +1868,29 @@ const PODMAN_MINIMUM_VERSION_FOR_LIBKRUN_SUPPORT = '5.2.0-rc1';
 // Checks if libkrun is supported. Only Mac platform allows this parameter to be tuned
 export function isLibkrunSupported(podmanVersion: string): boolean {
   return isMac() && compareVersions(podmanVersion, PODMAN_MINIMUM_VERSION_FOR_LIBKRUN_SUPPORT) >= 0;
+}
+
+// Set wslEnabled. Used for testing purposes
+export function setWSLEnabled(enabled: boolean): void {
+  wslEnabled = enabled;
+}
+
+export async function isWSLEnabled(): Promise<boolean> {
+  if (!isWindows()) {
+    return false;
+  }
+  const wslCheck = new SequenceCheck('WSL platform', [new WSLVersionCheck(), new WSL2Check()]);
+  const wslCheckResult = await wslCheck.execute();
+  return wslCheckResult.successful;
+}
+
+export async function isHyperVEnabled(): Promise<boolean> {
+  if (!isWindows()) {
+    return false;
+  }
+  const hyperVCheck = new HyperVCheck();
+  const hyperVCheckResult = await hyperVCheck.execute();
+  return hyperVCheckResult.successful;
 }
 
 export function sendTelemetryRecords(
@@ -1851,6 +1957,13 @@ export function sendTelemetryRecords(
         console.trace('unable to check wsl version', error);
         telemetryRecords.errorWslVersion = error;
       }
+    } else if (extensionApi.env.isLinux && telemetryRecords.provider === 'qemu') {
+      try {
+        telemetryRecords.qemuVersion = await qemuHelper.getQemuVersion();
+      } catch (err: unknown) {
+        console.trace('unable to check qemu version', err);
+        telemetryRecords.errorQemuVersion = err;
+      }
     }
 
     // add server side information about the machine
@@ -1882,6 +1995,9 @@ export async function createMachine(
   if (params['podman.factory.machine.provider']) {
     provider = getProviderByLabel(params['podman.factory.machine.provider']);
     telemetryRecords.provider = provider;
+  } else if (params['podman.factory.machine.win.provider']) {
+    provider = params['podman.factory.machine.win.provider'];
+    telemetryRecords.provider = provider;
   }
 
   // cpus
@@ -1900,7 +2016,9 @@ export async function createMachine(
   if (params['podman.factory.machine.memory']) {
     parameters.push('--memory');
     const memoryAsMiB = +params['podman.factory.machine.memory'] / (1024 * 1024);
-    parameters.push(Math.floor(memoryAsMiB).toString());
+    // Hyper-V requires VMs to have memory in 2 MB increments. So we round it
+    const roundedMemoryMiB = Math.floor((memoryAsMiB + 1) / 2) * 2;
+    parameters.push(roundedMemoryMiB.toString());
     telemetryRecords.memory = params['podman.factory.machine.memory'];
   }
 
@@ -1917,6 +2035,16 @@ export async function createMachine(
     parameters.push('--image-path');
     parameters.push(params['podman.factory.machine.image-path']);
     telemetryRecords.imagePath = 'custom';
+  } else if (params['podman.factory.machine.image-uri']) {
+    const imageUri = params['podman.factory.machine.image-uri'].trim();
+    parameters.push('--image-path');
+    if (imageUri.startsWith('https://') || imageUri.startsWith('http://')) {
+      parameters.push(imageUri);
+      telemetryRecords.imagePath = 'custom-url';
+    } else {
+      parameters.push(`docker://${imageUri}`);
+      telemetryRecords.imagePath = 'custom-registry';
+    }
   } else if (isMac() || isWindows()) {
     // check if we have an embedded asset for the image path for macOS or Windows
     let suffix = '';
@@ -2104,5 +2232,12 @@ export async function handleCompatibilityModeSetting(): Promise<void> {
     await socketCompatibilityMode.enable();
   } else {
     await socketCompatibilityMode.disable();
+  }
+}
+
+export function updateWSLHyperVEnabledContextValue(value: boolean): void {
+  if (wslAndHypervEnabledContextValue !== value) {
+    wslAndHypervEnabledContextValue = value;
+    extensionApi.context.setValue(WSL_HYPERV_ENABLED_KEY, value);
   }
 }

@@ -119,7 +119,7 @@
           "maximum": "HOST_TOTAL_CPU",
           "scope": "ContainerProviderConnectionFactory",
           "description": "CPU(s)",
-          "when": "podman.podmanMachineCpuSupported"
+          "when": "podman.podmanMachineCpuSupported && !podman.isCreateWSLOptionSelected"
         },
         "podman.factory.machine.memory": {
           "type": "number",
@@ -130,7 +130,7 @@
           "scope": "ContainerProviderConnectionFactory",
           "step": 500000000,
           "description": "Memory",
-          "when": "podman.podmanMachineMemorySupported"
+          "when": "podman.podmanMachineMemorySupported && !podman.isCreateWSLOptionSelected"
         },
         "podman.factory.machine.diskSize": {
           "type": "number",
@@ -141,13 +141,19 @@
           "step": 500000000,
           "scope": "ContainerProviderConnectionFactory",
           "description": "Disk size",
-          "when": "podman.podmanMachineDiskSupported"
+          "when": "podman.podmanMachineDiskSupported && !podman.isCreateWSLOptionSelected"
         },
         "podman.factory.machine.image-path": {
           "type": "string",
           "format": "file",
           "scope": "ContainerProviderConnectionFactory",
           "description": "Image Path (Optional)"
+        },
+        "podman.factory.machine.image-uri": {
+          "type": "string",
+          "scope": "ContainerProviderConnectionFactory",
+          "description": "Image URL or image reference (Optional)",
+          "placeholder": "Use 'registry/org/image:version' for image reference"
         },
         "podman.factory.machine.rootful": {
           "type": "boolean",
@@ -161,7 +167,7 @@
           "default": false,
           "scope": "ContainerProviderConnectionFactory",
           "markdownDescription": "User mode networking (traffic relayed by a user process). See [documentation](https://docs.podman.io/en/latest/markdown/podman-machine-init.1.html#user-mode-networking).",
-          "when": "podman.isUserModeNetworkingSupported == true"
+          "when": "podman.isUserModeNetworkingSupported == true && podman.isCreateWSLOptionSelected"
         },
         "podman.factory.machine.provider": {
           "type": "string",
@@ -173,6 +179,17 @@
           "scope": "ContainerProviderConnectionFactory",
           "description": "Provider Type",
           "when": "podman.isLibkrunSupported"
+        },
+        "podman.factory.machine.win.provider": {
+          "type": "string",
+          "default": "wsl",
+          "enum": [
+            "wsl",
+            "hyperv"
+          ],
+          "scope": "ContainerProviderConnectionFactory",
+          "description": "Provider Type",
+          "when": "podman.wslHypervEnabled"
         },
         "podman.factory.machine.now": {
           "type": "boolean",
@@ -382,11 +399,11 @@
     "watch": "vite build -w"
   },
   "dependencies": {
-    "@ltd/j-toml": "^1.38.0",
     "@podman-desktop/api": "workspace:*",
     "compare-versions": "^6.1.1",
     "ps-list": "^8.1.1",
-    "ssh2": "^1.15.0"
+    "smol-toml": "1.3.0",
+    "ssh2": "^1.16.0"
   },
   "devDependencies": {
     "@types/ssh2": "^1.15.1",
@@ -398,7 +415,7 @@
     "octokit": "^4.0.2",
     "sshpk": "^1.18.0",
     "tsx": "^4.19.1",
-    "vite": "^5.4.5",
-    "vitest": "^2.0.5"
+    "vite": "^5.4.8",
+    "vitest": "^2.1.2"
   }
 }

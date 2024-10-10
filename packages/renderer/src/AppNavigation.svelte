@@ -15,7 +15,6 @@ import DashboardIcon from './lib/images/DashboardIcon.svelte';
 import SettingsIcon from './lib/images/SettingsIcon.svelte';
 import NavItem from './lib/ui/NavItem.svelte';
 import NavRegistryEntry from './lib/ui/NavRegistryEntry.svelte';
-import NavSection from './lib/ui/NavSection.svelte';
 import { handleNavigation } from './navigation';
 import { navigationRegistry } from './stores/navigation/navigation-registry';
 
@@ -31,8 +30,8 @@ onMount(async () => {
   commandRegistry.init();
 });
 
-function clickSettings(b: boolean) {
-  if (b) {
+function handleClick(): void {
+  if (meta.url.startsWith('/preferences')) {
     exitSettingsCallback();
   } else {
     handleNavigation({ page: NavigationPage.RESOURCES });
@@ -53,22 +52,7 @@ function clickSettings(b: boolean) {
     </div>
   </NavItem>
   {#each $navigationRegistry as navigationRegistryItem}
-    <!-- This is a section -->
-    {#if navigationRegistryItem.type === 'section' && navigationRegistryItem.enabled}
-      {@const allItemsHidden = (navigationRegistryItem.items ?? []).every(item => item.hidden)}
-      {#if !allItemsHidden}
-        <NavSection tooltip={navigationRegistryItem.name}>
-          <!-- svelte-ignore svelte_component_deprecated -->
-          <svelte:component this={navigationRegistryItem.icon.iconComponent} size={iconSize} slot="icon" />
-
-          {#if navigationRegistryItem.items}
-            {#each navigationRegistryItem.items as item}
-              <NavRegistryEntry entry={item} bind:meta={meta} />
-            {/each}
-          {/if}
-        </NavSection>
-      {/if}
-    {:else if navigationRegistryItem.items && navigationRegistryItem.type === 'group'}
+    {#if navigationRegistryItem.items && navigationRegistryItem.type === 'group'}
       <!-- This is a group, list all items from the entry -->
       {#each navigationRegistryItem.items as item}
         <NavRegistryEntry entry={item} bind:meta={meta} />
@@ -89,11 +73,7 @@ function clickSettings(b: boolean) {
     </NavItem>
   </div>
 
-  <NavItem
-    href="/preferences"
-    tooltip="Settings"
-    bind:meta={meta}
-    onClick={() => clickSettings(meta.url.startsWith('/preferences'))}>
+  <NavItem href="/preferences" tooltip="Settings" bind:meta={meta} onClick={handleClick}>
     <SettingsIcon size={iconSize} />
   </NavItem>
 </nav>
